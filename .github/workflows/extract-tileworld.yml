@@ -1,0 +1,98 @@
+name: Extract TileWorld archive
+
+on:
+  push:
+    paths:
+      - 'TileWorld.zip'
+      - '.github/workflows/extract-tileworld.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Validate and extract archive
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os
+          import shutil
+          import stat
+          import zipfile
+          from pathlib import PurePosixPath
+          
+          archive = "TileWorld.zip"
+          staging = ".tileworld-extract"
+          if not os.path.isfile(archive):
+              raise SystemExit("TileWorld.zip is missing")
+          
+          with zipfile.ZipFile(archive) as zf:
+              infos = zf.infolist()
+              if not infos:
+                  raise SystemExit("Archive is empty")
+          
+              names = []
+              for info in infos:
+                  name = info.filename
+                  path = PurePosixPath(name)
+                  if not name or path.is_absolute() or ".." in path.parts or "\\" in name:
+                      raise SystemExit(f"Unsafe archive path: {name!r}")
+                  if path.parts and path.parts[0] in (".git", ".github", "TileWorld.zip"):
+                      raise SystemExit(f"Archive may not overwrite protected path: {name!r}")
+                  mode = info.external_attr >> 16
+                  if stat.S_ISLNK(mode):
+                      raise SystemExit(f"Symbolic links are not allowed: {name!r}")
+                  names.append(path)
+          
+              # Remove one common wrapper directory, if the whole archive uses it.
+              first_parts = {p.parts[0] for p in names if p.parts}
+              has_root_files = any(len(p.parts) == 1 and not p.as_posix().endswith("/") for p in names)
+              strip_root = next(iter(first_parts)) if len(first_parts) == 1 and not has_root_files else None
+          
+              shutil.rmtree(staging, ignore_errors=True)
+              os.makedirs(staging)
+              for info, path in zip(infos, names):
+                  parts = path.parts[1:] if strip_root and path.parts and path.parts[0] == strip_root else path.parts
+                  if not parts:
+                      continue
+                  target = os.path.join(staging, *parts)
+                  if info.is_dir():
+                      os.makedirs(target, exist_ok=True)
+                      continue
+                  os.makedirs(os.path.dirname(target), exist_ok=True)
+                  with zf.open(info) as src, open(target, "wb") as dst:
+                      shutil.copyfileobj(src, dst)
+          
+          # Merge extracted files into the repository without touching Git metadata,
+          # the workflow itself, or the source archive.
+          for name in os.listdir(staging):
+              src = os.path.join(staging, name)
+              dst = os.path.join(os.getcwd(), name)
+              if os.path.isdir(src) and not os.path.islink(src):
+                  if os.path.exists(dst) and not os.path.isdir(dst):
+                      os.remove(dst)
+                  shutil.copytree(src, dst, dirs_exist_ok=True)
+              else:
+                  if os.path.isdir(dst):
+                      shutil.rmtree(dst)
+                  shutil.copy2(src, dst)
+          shutil.rmtree(staging)
+          PY
+
+      - name: Commit extracted files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No extracted changes to commit."
+          else
+            git commit -m "Extract TileWorld.zip"
+            git push
+          fi
